@@ -1,0 +1,36 @@
+[package]
+name = "predator-control"
+version = "0.1.0"
+description = "Acer Predator PHN16-71 System Control"
+authors = ["ln678090"]
+edition = "2021"
+
+[lib]
+name = "predator_control_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+sysinfo = "0.39.6"
+tauri-plugin-opener = "2.5.5"
+
+# Tăng tốc build: parallel compilation
+[profile.release]
+lto = "thin"              # LTO mỏng → nhanh hơn full LTO nhưng vẫn tối ưu
+codegen-units = 16        # Compile song song 16 units
+opt-level = 3             # Tối ưu hiệu năng
+strip = "symbols"         # Chỉ strip symbols, giữ debug info
+
+# Profile dev cho build nhanh khi test
+[profile.dev]
+opt-level = 0
+debug = false
+lto = false
+codegen-units = 16

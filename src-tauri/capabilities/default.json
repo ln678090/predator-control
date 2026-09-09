@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Cấp toàn quyền IPC cho giao diện",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
