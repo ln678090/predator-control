@@ -1,13 +1,21 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use sysinfo::{Components, CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-use std::io::{self, Write};
+use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
+
+/* ============================================================
+ * DATA STRUCTS
+ * ========================================================== */
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareTelemetry {
     pub cpu_usage: f32,
     pub cpu_temp: f32,
+    pub ram_temp: f32,
+    pub nvme_temp: f32,
+    pub motherboard_temp: f32,
     pub gpu_usage: Option<f32>,
     pub gpu_temp: Option<f32>,
     pub gpu_mem_used: Option<f32>,
@@ -27,6 +35,30 @@ pub struct SystemStatus {
     pub battery_status: String,
     pub telemetry: HardwareTelemetry,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanAutoStatus {
+    pub enabled: bool,
+    pub max_temp_c: f32,
+    pub fan_percent: u8,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanServiceStatus {
+    pub active: bool,
+    pub enabled: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FanServiceLog {
+    pub lines: Vec<String>,
+}
+
+/* ============================================================
+ * PREDATOR CONTROL
+ * ========================================================== */
 
 pub struct PredatorControl {
     hwmon_dir: PathBuf,
@@ -53,7 +85,6 @@ impl PredatorControl {
             "Không tìm thấy node hwmon nào trong /sys/devices/platform/acer-wmi/hwmon".to_string()
         })?;
 
-        // Ưu tiên node platform-profile mới nếu có, fallback về node gốc
         let modern_profile = PathBuf::from("/sys/devices/platform/acer-wmi/platform-profile/platform-profile-0/profile");
         let fallback_profile = PathBuf::from("/sys/devices/platform/acer-wmi/thermal_profile");
         let profile_path = if modern_profile.exists() {
@@ -69,18 +100,98 @@ impl PredatorControl {
         })
     }
 
-    /// Chuyển đổi 0-100% sang dải PWM hiệu dụng (0 - 500)
     fn percent_to_pwm(percent: u8) -> u32 {
         if percent == 0 {
             0
         } else {
-            // Tỷ lệ tuyến tính: 1% -> 5 PWM, 100% -> 500 PWM
             (percent as u32 * 5).min(500)
         }
     }
 
-    /// Đặt chế độ quạt: cpu/gpu từ 0 đến 100%. Nếu bằng 0 thì về Auto.
-// Thay thế hàm set_fan_speed trong impl PredatorControl:
+    fn read_hwmon_temps() -> (f32, f32, f32, f32) {
+        let mut cpu = 0.0;
+        let mut ram_sum = 0.0;
+        let mut ram_count = 0u32;
+        let mut nvme = 0.0;
+        let mut motherboard = 0.0;
+
+        let hwmon_dir = std::path::Path::new("/sys/class/hwmon");
+        if let Ok(entries) = std::fs::read_dir(hwmon_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(name) = std::fs::read_to_string(path.join("name")) {
+                    let name = name.trim();
+                    match name {
+                        "coretemp" => {
+                            if let Ok(val) = std::fs::read_to_string(path.join("temp1_input")) {
+                                if let Ok(milli) = val.trim().parse::<f32>() {
+                                    cpu = milli / 1000.0;
+                                }
+                            }
+                        }
+                        "nvme" => {
+                            if let Ok(val) = std::fs::read_to_string(path.join("temp1_input")) {
+                                if let Ok(milli) = val.trim().parse::<f32>() {
+                                    nvme = milli / 1000.0;
+                                }
+                            }
+                        }
+                        "spd5118" => {
+                            if let Ok(val) = std::fs::read_to_string(path.join("temp1_input")) {
+                                if let Ok(milli) = val.trim().parse::<f32>() {
+                                    ram_sum += milli / 1000.0;
+                                    ram_count += 1;
+                                }
+                            }
+                        }
+                        "acpitz" => {
+                            if let Ok(val) = std::fs::read_to_string(path.join("temp1_input")) {
+                                if let Ok(milli) = val.trim().parse::<f32>() {
+                                    motherboard = milli / 1000.0;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let ram = if ram_count > 0 {
+            ram_sum / ram_count as f32
+        } else {
+            0.0
+        };
+
+        (cpu, ram, nvme, motherboard)
+    }
+
+    pub fn get_max_temp_celsius() -> f32 {
+        let mut max = 0.0;
+        let hwmon_dir = std::path::Path::new("/sys/class/hwmon");
+        
+        if let Ok(entries) = std::fs::read_dir(hwmon_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(name) = std::fs::read_to_string(path.join("name")) {
+                    let name = name.trim();
+                    if matches!(name, "coretemp" | "spd5118" | "nvme" | "acpitz") {
+                        if let Ok(val) = std::fs::read_to_string(path.join("temp1_input")) {
+                            if let Ok(milli) = val.trim().parse::<f32>() {
+                                let temp = milli / 1000.0;
+                                if temp > max {
+                                    max = temp;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        max
+    }
+
     pub fn set_fan_speed(&self, cpu_percent: u8, gpu_percent: u8) -> Result<(), String> {
         eprintln!("[PREDATOR-RUST] Nhận lệnh fan: CPU={}%, GPU={}%", cpu_percent, gpu_percent);
 
@@ -95,59 +206,26 @@ impl PredatorControl {
         let pwm1 = self.hwmon_dir.join("pwm1");
         let pwm2 = self.hwmon_dir.join("pwm2");
 
-        // CPU Fan
         if cpu_percent == 0 {
-            eprintln!("[PREDATOR-RUST] Đang ghi '2' vào {:?}", pwm1_enable);
-            fs::write(&pwm1_enable, "2").map_err(|e| {
-                let msg = format!("Lỗi đặt Auto CPU ({:?}): {}", pwm1_enable, e);
-                eprintln!("[PREDATOR-RUST ERROR] {}", msg);
-                msg
-            })?;
+            fs::write(&pwm1_enable, "2").map_err(|e| format!("Lỗi đặt Auto CPU: {}", e))?;
         } else {
-            eprintln!("[PREDATOR-RUST] Đang ghi '1' vào {:?}", pwm1_enable);
-            fs::write(&pwm1_enable, "1").map_err(|e| {
-                let msg = format!("Lỗi bật Manual CPU ({:?}): {}", pwm1_enable, e);
-                eprintln!("[PREDATOR-RUST ERROR] {}", msg);
-                msg
-            })?;
+            fs::write(&pwm1_enable, "1").map_err(|e| format!("Lỗi bật Manual CPU: {}", e))?;
             let val = Self::percent_to_pwm(cpu_percent);
-            eprintln!("[PREDATOR-RUST] Đang ghi '{}' vào {:?}", val, pwm1);
-            fs::write(&pwm1, val.to_string()).map_err(|e| {
-                let msg = format!("Lỗi ghi PWM CPU ({:?}): {}", pwm1, e);
-                eprintln!("[PREDATOR-RUST ERROR] {}", msg);
-                msg
-            })?;
+            fs::write(&pwm1, val.to_string()).map_err(|e| format!("Lỗi ghi PWM CPU: {}", e))?;
         }
 
-        // GPU Fan
         if gpu_percent == 0 {
-            eprintln!("[PREDATOR-RUST] Đang ghi '2' vào {:?}", pwm2_enable);
-            fs::write(&pwm2_enable, "2").map_err(|e| {
-                let msg = format!("Lỗi đặt Auto GPU ({:?}): {}", pwm2_enable, e);
-                eprintln!("[PREDATOR-RUST ERROR] {}", msg);
-                msg
-            })?;
+            fs::write(&pwm2_enable, "2").map_err(|e| format!("Lỗi đặt Auto GPU: {}", e))?;
         } else {
-            eprintln!("[PREDATOR-RUST] Đang ghi '1' vào {:?}", pwm2_enable);
-            fs::write(&pwm2_enable, "1").map_err(|e| {
-                let msg = format!("Lỗi bật Manual GPU ({:?}): {}", pwm2_enable, e);
-                eprintln!("[PREDATOR-RUST ERROR] {}", msg);
-                msg
-            })?;
+            fs::write(&pwm2_enable, "1").map_err(|e| format!("Lỗi bật Manual GPU: {}", e))?;
             let val = Self::percent_to_pwm(gpu_percent);
-            eprintln!("[PREDATOR-RUST] Đang ghi '{}' vào {:?}", val, pwm2);
-            fs::write(&pwm2, val.to_string()).map_err(|e| {
-                let msg = format!("Lỗi ghi PWM GPU ({:?}): {}", pwm2, e);
-                eprintln!("[PREDATOR-RUST ERROR] {}", msg);
-                msg
-            })?;
+            fs::write(&pwm2, val.to_string()).map_err(|e| format!("Lỗi ghi PWM GPU: {}", e))?;
         }
 
         eprintln!("[PREDATOR-RUST SUCCESS] Điều khiển quạt thành công!");
         Ok(())
     }
 
-    /// Đọc tốc độ quạt (quy đổi thành tỷ lệ phần trăm 0-100% dựa trên max ~6300 RPM)
     pub fn get_fan_speed(&self) -> Result<(u8, u8), String> {
         let f1 = fs::read_to_string(self.hwmon_dir.join("fan1_input"))
             .unwrap_or_else(|_| "0".into())
@@ -161,7 +239,6 @@ impl PredatorControl {
             .parse::<f32>()
             .unwrap_or(0.0);
 
-        // Quy đổi ước lượng dựa trên dải đo thực nghiệm ~6300 RPM max
         let cpu_pct = ((f1 / 6350.0) * 100.0).clamp(0.0, 100.0) as u8;
         let gpu_pct = ((f2 / 6200.0) * 100.0).clamp(0.0, 100.0) as u8;
 
@@ -169,11 +246,10 @@ impl PredatorControl {
     }
 
     pub fn set_profile(&self, mode: &str) -> Result<(), String> {
-        // Hỗ trợ cả 2 chuẩn: tên chuỗi (platform-profile) hoặc mã số (thermal_profile legacy)
         if self.profile_path.to_string_lossy().contains("platform-profile") {
             let valid = ["low-power", "quiet", "balanced", "balanced-performance", "performance"];
             if !valid.contains(&mode) {
-                return Err(format!("Chế độ không hợp lệ: {}. Danh sách hỗ trợ: {:?}", mode, valid));
+                return Err(format!("Chế độ không hợp lệ: {}", mode));
             }
             fs::write(&self.profile_path, mode).map_err(|e| format!("Lỗi đặt platform-profile: {}", e))?;
         } else {
@@ -183,7 +259,7 @@ impl PredatorControl {
                 "performance" => "4",
                 "turbo" => "5",
                 "low-power" | "eco" => "6",
-                _ => return Err("Chế độ mã số không hỗ trợ".into()),
+                _ => return Err("Chế độ không hỗ trợ".into()),
             };
             fs::write(&self.profile_path, code).map_err(|e| format!("Lỗi đặt thermal_profile: {}", e))?;
         }
@@ -195,7 +271,6 @@ impl PredatorControl {
             .map_err(|e| format!("Không thể đọc chế độ hiệu năng: {}", e))?;
         let trimmed = data.trim();
 
-        // Chuẩn hóa tên profile nếu trả về dạng mã số
         let normalized = match trimmed {
             "0" => "quiet",
             "1" => "balanced",
@@ -237,6 +312,8 @@ impl PredatorControl {
     }
 
     pub fn get_telemetry(&self) -> HardwareTelemetry {
+        let (cpu_temp, ram_temp, nvme_temp, motherboard_temp) = Self::read_hwmon_temps();
+
         let mut sys = System::new_with_specifics(
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::nothing().with_cpu_usage())
@@ -247,20 +324,6 @@ impl PredatorControl {
         sys.refresh_memory();
 
         let cpu_usage = sys.global_cpu_usage();
-        let components = Components::new_with_refreshed_list();
-        let mut cpu_temp = 0.0;
-
-        for c in &components {
-            let label = c.label().to_lowercase();
-            if label.contains("core") || label.contains("cpu") || label.contains("package") {
-                if let Some(t) = c.temperature() {
-                    if t > cpu_temp {
-                        cpu_temp = t;
-                    }
-                }
-            }
-        }
-
         let ram_total = sys.total_memory() as f32 / (1024.0 * 1024.0 * 1024.0);
         let ram_used = sys.used_memory() as f32 / (1024.0 * 1024.0 * 1024.0);
         let ram_percent = if ram_total > 0.0 { (ram_used / ram_total) * 100.0 } else { 0.0 };
@@ -288,6 +351,9 @@ impl PredatorControl {
         HardwareTelemetry {
             cpu_usage,
             cpu_temp,
+            ram_temp,
+            nvme_temp,
+            motherboard_temp,
             gpu_usage,
             gpu_temp,
             gpu_mem_used,
@@ -316,8 +382,48 @@ impl PredatorControl {
             telemetry,
         })
     }
+
+    pub fn auto_fan_step(&self) -> Result<FanAutoStatus, String> {
+        let max_temp = Self::get_max_temp_celsius();
+        let fan_percent;
+        let message;
+
+        if max_temp >= 60.0 {
+            fan_percent = 70;
+            message = format!("Temp {:.0}°C → Fan 70%", max_temp);
+        } else if max_temp <= 50.0 {
+            fan_percent = 40;
+            message = format!("Temp {:.0}°C → Fan 40%", max_temp);
+        } else {
+            fan_percent = 0;
+            message = format!("Temp {:.0}°C (hold)", max_temp);
+        }
+
+        if fan_percent > 0 {
+            let pwm1_enable = self.hwmon_dir.join("pwm1_enable");
+            let pwm2_enable = self.hwmon_dir.join("pwm2_enable");
+            let pwm1 = self.hwmon_dir.join("pwm1");
+            let pwm2 = self.hwmon_dir.join("pwm2");
+
+            let pwm_val = (fan_percent * 255 / 100) as u32;
+            let _ = fs::write(&pwm1_enable, "1");
+            let _ = fs::write(&pwm2_enable, "1");
+            let _ = fs::write(&pwm1, pwm_val.to_string());
+            let _ = fs::write(&pwm2, pwm_val.to_string());
+        }
+
+        Ok(FanAutoStatus {
+            enabled: true,
+            max_temp_c: max_temp,
+            fan_percent,
+            message,
+        })
+    }
 }
 
+/* ============================================================
+ * TAURI COMMANDS
+ * ========================================================== */
 
 #[tauri::command]
 fn set_fan_speed(cpu: u8, gpu: u8) -> Result<(), String> {
@@ -346,7 +452,9 @@ fn set_fan_speed(cpu: u8, gpu: u8) -> Result<(), String> {
             Err(e)
         }
     }
-}#[tauri::command]
+}
+
+#[tauri::command]
 fn get_status() -> Result<SystemStatus, String> {
     let pc = PredatorControl::new()?;
     pc.get_status()
@@ -379,11 +487,88 @@ fn set_profile(mode: String) -> Result<(), String> {
             Err(e)
         }
     }
-}#[tauri::command]
+}
+
+#[tauri::command]
 fn set_battery_threshold(threshold: u8) -> Result<(), String> {
     let pc = PredatorControl::new()?;
     pc.set_battery_threshold(threshold)
 }
+
+#[tauri::command]
+fn get_fan_auto_status() -> Result<FanAutoStatus, String> {
+    let pc = PredatorControl::new()?;
+    pc.auto_fan_step()
+}
+
+#[tauri::command]
+fn get_fan_service_status() -> Result<FanServiceStatus, String> {
+    let output = Command::new("systemctl")
+        .args(["is-active", "fan-auto-temp.service"])
+        .output()
+        .map_err(|e| format!("Lỗi chạy systemctl: {}", e))?;
+    
+    let active = String::from_utf8_lossy(&output.stdout).trim() == "active";
+    
+    let output = Command::new("systemctl")
+        .args(["is-enabled", "fan-auto-temp.service"])
+        .output()
+        .map_err(|e| format!("Lỗi chạy systemctl: {}", e))?;
+    
+    let enabled = String::from_utf8_lossy(&output.stdout).trim() == "enabled";
+    
+    let message = if active {
+        "Service đang chạy (Fan auto)".to_string()
+    } else if enabled {
+        "Service đã bật (chờ khởi động)".to_string()
+    } else {
+        "Service đang tắt".to_string()
+    };
+    
+    Ok(FanServiceStatus { active, enabled, message })
+}
+
+#[tauri::command]
+fn set_fan_service(enable: bool) -> Result<String, String> {
+    let action = if enable { "start" } else { "stop" };
+    let output = Command::new("sudo")
+        .args(["systemctl", action, "fan-auto-temp.service"])
+        .output()
+        .map_err(|e| format!("Lỗi chạy systemctl: {}", e))?;
+    
+    if !output.status.success() {
+        return Err(format!("Lỗi: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    
+    let msg = if enable {
+        "✓ Đã bật fan-auto-temp.service"
+    } else {
+        "✓ Đã tắt fan-auto-temp.service"
+    };
+    
+    Ok(msg.to_string())
+}
+
+#[tauri::command]
+fn get_fan_service_log() -> Result<FanServiceLog, String> {
+    let output = Command::new("journalctl")
+        .args(["-u", "fan-auto-temp.service", "-n", "20", "--no-pager"])
+        .output()
+        .map_err(|e| format!("Lỗi chạy journalctl: {}", e))?;
+    
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.contains("Temp") || l.contains("Fan"))
+        .map(|l| l.split(": ").last().unwrap_or("").to_string())
+        .collect();
+    
+    Ok(FanServiceLog { lines })
+}
+
+/* ============================================================
+ * MAIN
+ * ========================================================== */
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -392,7 +577,11 @@ pub fn run() {
             get_status,
             set_fan_speed,
             set_profile,
-            set_battery_threshold
+            set_battery_threshold,
+            get_fan_auto_status,
+            get_fan_service_status,
+            set_fan_service,
+            get_fan_service_log
         ])
         .run(tauri::generate_context!())
         .expect("Lỗi khởi chạy ứng dụng Tauri");
