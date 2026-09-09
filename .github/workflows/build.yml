@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -34,11 +37,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install
-        working-directory: .
 
       - name: Build release
         run: pnpm tauri build
-        working-directory: .
 
       - name: Create Release with Binary
         uses: softprops/action-gh-release@v1
